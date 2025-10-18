@@ -1,0 +1,28 @@
+{
+  "name": "agent_town",
+  "version": "0.0.1",
+  "description": "Price config.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/teststaybaka/agent_town.git"
+  },
+  "author": "Yuxuan Xie <teststaybaka@gmail.com>",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/teststaybaka/agent_town/issues"
+  },
+  "homepage": "https://github.com/teststaybaka/agent_town#readme",
+  "devDependencies": {
+    "@selfage/cli": "^5.0.1",
+    "@selfage/tsconfig": "^1.1.0",
+    "@types/node": "^24.6.2",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@google-cloud/vertexai": "^1.10.0",
+    "dotenv": "^17.2.3",
+    "mineflayer": "^4.33.0",
+    "mineflayer-pathfinder": "^2.4.5",
+    "vec3": "^0.1.10"
+  }
+}
