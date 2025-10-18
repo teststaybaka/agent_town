@@ -8,6 +8,7 @@ import {
 } from "@google-cloud/vertexai";
 import mineflayer = require("mineflayer");
 import { pathfinder, Movements, goals } from "mineflayer-pathfinder";
+import { Vec3 } from "vec3";
 
 let CONFIG = {
   host: process.env.HOST,
@@ -28,6 +29,7 @@ interface Percept {
   oxygenLevel?: number;
   position?: { x: number; y: number; z: number };
   onGround?: boolean;
+  inWater?: boolean;
   inventoryItems?: Array<{ name: string; count: number }>;
   blocksAroundMe?: Array<{ x: number; y: number; z: number; type: string }>;
   entitiesAroundMe?: Array<{
@@ -110,8 +112,9 @@ export class AiBot {
               "You are a survival-focused Minecraft agent.",
               "Stay alive by managing health and hunger, avoiding dangers, and hunting animals for food or attacking enemies if necessary.",
               "You cannot dig or build, so always move to an empty block.",
-              "Do not move too far each step (within 30 blocks).",
-              "If low on health or hunger, and no food is available, walk further to find animals to hunt.",
+              "Avoid water unless necessary.",
+              "If low on health or hunger, and no food is available, try walk further to find animals to hunt.",
+              "You can move to the position where a food item is located to pick it up.",
               "One action at a time.",
               "If no action is needed, do nothing.",
             ].join(" "),
@@ -138,6 +141,11 @@ export class AiBot {
       }
     }
 
+    let headBlock = this.bot.blockAt(new Vec3(
+      this.bot.entity.position.x,
+      this.bot.entity.position.y + this.bot.entity.height * 0.9,
+      this.bot.entity.position.z,
+    ));
     return {
       timeOfDay: this.bot.time.timeOfDay,
       isDay: this.bot.time.isDay,
@@ -146,6 +154,7 @@ export class AiBot {
       oxygenLevel: this.bot.oxygenLevel,
       position: this.bot.entity.position,
       onGround: this.bot.entity.onGround,
+      inWater: headBlock?.name === "water",
       inventoryItems: this.bot.inventory.items().map((item) => ({
         name: item.name,
         count: item.count,
@@ -188,15 +197,20 @@ export class AiBot {
     });
 
     // Parse tool calls (Vertex returns "candidates[].content.parts[].functionCall")
+    let functionCalled = false;
     for (let cand of resp.response.candidates ?? []) {
       for (let part of cand?.content?.parts ?? []) {
         if (part.functionCall?.name) {
+          functionCalled = true;
           await this.executeToolCall(
             part.functionCall.name,
             part.functionCall.args,
           );
         }
       }
+    }
+    if (!functionCalled) {
+      this.bot.chat("No action needed. I will stay put.");
     }
 
     setTimeout(() => this.action(), AiBot.LOOP_INTERVAL_MS);
@@ -295,10 +309,11 @@ function start() {
     console.log("[bot] logged in as", bot.username);
   });
 
-  bot.once("spawn", () => {
+  bot.once("spawn", async () => {
     console.log("[bot] spawned in world at", bot.entity.position);
     bot.chat("Spawned! I will try to survive.");
 
+    await bot.waitForTicks(40); // ~2 seconds
     let movements = new Movements(bot);
     movements.canDig = false;
     movements.allow1by1towers = false;
@@ -315,17 +330,7 @@ function start() {
       bot.chat(`My coords: ${bot.entity.position.toString()}`);
   });
 
-  bot.on("path_update", (r) => {
-    console.log("path_update:", {
-      status: r.status, // 'success' | 'noPath' | 'partial' | 'timeout'
-      nodes: r.path?.length ?? 0,
-      time: r.time,
-      visited: r.visitedNodes,
-    });
-  });
-
   bot.on("goal_reached", (g) => console.log("goal_reached:", g));
-  bot.on("goal_updated", (g) => console.log("goal_updated:", g));
   bot.on("path_reset", (reason) => console.log("path_reset:", reason));
 
   bot.on("kicked", (reason, loggedIn) => {
