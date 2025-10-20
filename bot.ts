@@ -1,14 +1,18 @@
 require("dotenv").config();
 import {
   FunctionCallingMode,
-  FunctionDeclarationSchemaType,
   GenerativeModel,
-  Tool,
   VertexAI,
 } from "@google-cloud/vertexai";
 import mineflayer = require("mineflayer");
-import { pathfinder, Movements, goals } from "mineflayer-pathfinder";
+import { pathfinder, Movements } from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
+import {
+  ActionChains,
+  FollowAndAttackAction,
+  EatAction,
+  MoveToPositionAction,
+} from "./actions";
 
 let CONFIG = {
   host: process.env.HOST,
@@ -31,7 +35,18 @@ interface Percept {
   onGround?: boolean;
   inWater?: boolean;
   inventoryItems?: Array<{ name: string; count: number }>;
-  blocksAroundMe?: Array<{ x: number; y: number; z: number; type: string }>;
+  solidBlocksAroundMe?: Array<{
+    x: number;
+    y: number;
+    z: number;
+    type: string;
+  }>;
+  emptyBlocksAroundMe?: Array<{
+    x: number;
+    y: number;
+    z: number;
+    type: string;
+  }>;
   entitiesAroundMe?: Array<{
     entityId: number;
     name?: string;
@@ -42,55 +57,21 @@ interface Percept {
   }>;
 }
 
-export class AiBot {
-  private static TOOLS: Tool[] = [
-    {
-      functionDeclarations: [
-        {
-          name: "move_to_position",
-          description: "Move to a position of coordinates (x, y, z).",
-          parameters: {
-            type: FunctionDeclarationSchemaType.OBJECT,
-            properties: {
-              x: { type: FunctionDeclarationSchemaType.NUMBER },
-              y: { type: FunctionDeclarationSchemaType.NUMBER },
-              z: { type: FunctionDeclarationSchemaType.NUMBER },
-            },
-            required: ["x", "y", "z"],
-          },
-        },
-        {
-          name: "eat",
-          description: "Eat an item from inventory by name.",
-          parameters: {
-            type: FunctionDeclarationSchemaType.OBJECT,
-            properties: {
-              itemName: { type: FunctionDeclarationSchemaType.STRING },
-            },
-            required: ["itemName"],
-          },
-        },
-        {
-          name: "follow_and_attack",
-          description: "Follow and attack an entity by its ID.",
-          parameters: {
-            type: FunctionDeclarationSchemaType.OBJECT,
-            properties: {
-              entityId: { type: FunctionDeclarationSchemaType.NUMBER },
-            },
-            required: ["entityId"],
-          },
-        },
-      ],
-    },
-  ];
+class AiBot {
   private static LOOP_INTERVAL_MS = 10000;
-  private static SENSE_RADIUS = 5;
-  private static FOLLOW_RANGE = 1.2;
-  private static ATTACK_RANGE = 3;
+  private static SCAN_RADIUS = 10;
+  private static AIR_SCAN_RADIUS = 5;
+  private static DIRECTIONS = [
+    { x: 1, y: 0, z: 0 },
+    { x: -1, y: 0, z: 0 },
+    { x: 0, y: 0, z: 1 },
+    { x: 0, y: 0, z: -1 },
+    { x: 0, y: 1, z: 0 },
+    { x: 0, y: -1, z: 0 },
+  ];
 
   private model: GenerativeModel;
-  private lastAttackTick: () => void = () => {};
+  private actions = new ActionChains(this.bot);
 
   constructor(private bot: mineflayer.Bot) {
     let vertex = new VertexAI({
@@ -99,7 +80,15 @@ export class AiBot {
     });
     this.model = vertex.getGenerativeModel({
       model: CONFIG.model,
-      tools: AiBot.TOOLS,
+      tools: [
+        {
+          functionDeclarations: [
+            MoveToPositionAction.FUNCTION_DELCLARATION,
+            EatAction.FUNCTION_DELCLARATION,
+            FollowAndAttackAction.FUNCTION_DELCLARATION,
+          ],
+        },
+      ],
       generationConfig: {
         temperature: 0.3,
         maxOutputTokens: 1024,
@@ -109,13 +98,13 @@ export class AiBot {
         parts: [
           {
             text: [
-              "You are a survival-focused Minecraft agent.",
-              "Stay alive by managing health and hunger, avoiding dangers, and hunting animals for food or attacking enemies if necessary.",
-              "You cannot dig or build, so always move to an empty block.",
+              "You are a survival-focused Minecraft bot. Stay alive as long as possible.",
               "Avoid water unless necessary.",
+              "Stay away from hostile mobs unless you need to attack them for survival. Some enemies have ranged attacks. So keep your distance really far away.",
+              "If low on health or hunger, try to eat food from your inventory first.",
               "If low on health or hunger, and no food is available, try walk further to find animals to hunt.",
               "You can move to the position where a food item is located to pick it up.",
-              "One action at a time.",
+              "You will only output actions every 10 seconds. Please chain multiple actions together. They will be executed sequentially.",
               "If no action is needed, do nothing.",
             ].join(" "),
           },
@@ -124,28 +113,78 @@ export class AiBot {
     });
   }
 
-  private async sense(): Promise<Percept> {
-    let blocks: Array<{ x: number; y: number; z: number; type: string }> = [];
-    let center = this.bot.entity.position.floored();
-    for (let dx = -AiBot.SENSE_RADIUS; dx <= AiBot.SENSE_RADIUS; dx++) {
-      for (let dy = -AiBot.SENSE_RADIUS; dy <= AiBot.SENSE_RADIUS; dy++) {
-        for (let dz = -AiBot.SENSE_RADIUS; dz <= AiBot.SENSE_RADIUS; dz++) {
-          let pos = center.offset(dx, dy, dz);
-          blocks.push({
+  private async scan(): Promise<Percept> {
+    let headBlock = this.bot.blockAt(
+      new Vec3(
+        this.bot.entity.position.x,
+        this.bot.entity.position.y + this.bot.entity.height * 0.9,
+        this.bot.entity.position.z,
+      ),
+    );
+    let center = headBlock.position.floored();
+    let solidBlocksAroundMe: Array<{
+      x: number;
+      y: number;
+      z: number;
+      type: string;
+    }> = [];
+    let emptyBlocksAroundMe: Array<{
+      x: number;
+      y: number;
+      z: number;
+      type: string;
+    }> = [];
+    let seen = new Set<string>();
+    center;
+    let i = 0;
+    let queues: Array<{ x: number; y: number; z: number }> = [
+      { x: center.x, y: center.y, z: center.z },
+    ];
+    while (i < queues.length) {
+      let pos = queues[i];
+      let thisBlock = this.bot.blockAt(new Vec3(pos.x, pos.y, pos.z));
+      let dist =
+        Math.abs(pos.x - center.x) +
+        Math.abs(pos.y - center.y) +
+        Math.abs(pos.z - center.z);
+      if (dist <= AiBot.SCAN_RADIUS && thisBlock) {
+        if (thisBlock.boundingBox === "block") {
+          solidBlocksAroundMe.push({
             x: pos.x,
             y: pos.y,
             z: pos.z,
-            type: this.bot.blockAt(pos)?.displayName ?? "empty",
+            type: thisBlock.displayName,
           });
+        } else if (thisBlock.boundingBox === "empty") {
+          if (dist <= AiBot.AIR_SCAN_RADIUS) {
+            emptyBlocksAroundMe.push({
+              x: pos.x,
+              y: pos.y,
+              z: pos.z,
+              type: thisBlock.displayName,
+            });
+          }
+          for (let dir of AiBot.DIRECTIONS) {
+            let neighbor = {
+              x: pos.x + dir.x,
+              y: pos.y + dir.y,
+              z: pos.z + dir.z,
+            };
+            let key = `${neighbor.x},${neighbor.y},${neighbor.z}`;
+            if (seen.has(key)) {
+              continue;
+            }
+            seen.add(key);
+            queues.push(neighbor);
+          }
         }
       }
+      i++;
     }
+    console.log(
+      `[bot] ${this.bot.username} scanned ${solidBlocksAroundMe.length} solid blocks and ${emptyBlocksAroundMe.length} empty blocks around me`,
+    );
 
-    let headBlock = this.bot.blockAt(new Vec3(
-      this.bot.entity.position.x,
-      this.bot.entity.position.y + this.bot.entity.height * 0.9,
-      this.bot.entity.position.z,
-    ));
     return {
       timeOfDay: this.bot.time.timeOfDay,
       isDay: this.bot.time.isDay,
@@ -159,7 +198,8 @@ export class AiBot {
         name: item.name,
         count: item.count,
       })),
-      blocksAroundMe: blocks,
+      solidBlocksAroundMe: solidBlocksAroundMe,
+      emptyBlocksAroundMe: emptyBlocksAroundMe,
       entitiesAroundMe: Object.values(this.bot.entities)
         .filter((e) => e.id !== this.bot.entity.id)
         .map((e) => ({
@@ -177,9 +217,14 @@ export class AiBot {
     };
   }
 
-  public async action(): Promise<void> {
-    let percept = await this.sense();
-    this.bot.chat(`Status summary: ${percept.health} HP, ${percept.food} food, position at ${JSON.stringify(percept.position)}`);
+  public async act(): Promise<void> {
+    let percept = await this.scan();
+    this.bot.chat(
+      `Status summary: ${percept.health} HP, ${percept.food} food, position at ${JSON.stringify(percept.position)}`,
+    );
+    console.log(
+      `[bot] ${this.bot.username} current actions: ${JSON.stringify(this.actions.toJSON())}`,
+    );
 
     let resp = await this.model.generateContent({
       contents: [
@@ -187,7 +232,7 @@ export class AiBot {
           role: "user",
           parts: [
             {
-              text: `My current position and observed state: \n${JSON.stringify(percept)}\nNote that the info can be a little outdated.\nWhat is my next action?`,
+              text: `My current position and observed state: \n${JSON.stringify(percept)}\nMy current actions: \n${JSON.stringify(this.actions)}\nWhat is my next action or sequence of actions?`,
             },
           ],
         },
@@ -197,98 +242,41 @@ export class AiBot {
     });
 
     // Parse tool calls (Vertex returns "candidates[].content.parts[].functionCall")
-    let functionCalled = false;
+    await this.actions.reset();
     for (let cand of resp.response.candidates ?? []) {
       for (let part of cand?.content?.parts ?? []) {
         if (part.functionCall?.name) {
-          functionCalled = true;
-          await this.executeToolCall(
-            part.functionCall.name,
-            part.functionCall.args,
-          );
+          this.addAction(part.functionCall.name, part.functionCall.args);
         }
       }
     }
-    if (!functionCalled) {
-      this.bot.chat("No action needed. I will stay put.");
-    }
+    this.actions.start();
 
-    setTimeout(() => this.action(), AiBot.LOOP_INTERVAL_MS);
+    setTimeout(() => this.act(), AiBot.LOOP_INTERVAL_MS);
   }
 
-  private async executeToolCall(name: string, args: any): Promise<void> {
-    this.bot.removeListener("physicsTick", this.lastAttackTick);
+  private addAction(name: string, args: any): void {
+    console.log(
+      `[bot] ${this.bot.username} adding action: ${name} with args ${JSON.stringify(args)}`,
+    );
     switch (name) {
       case "move_to_position":
         let x = args.x;
         let y = args.y;
         let z = args.z;
-        await this.moveTo(x, y, z);
+        this.actions.add(new MoveToPositionAction(this.bot, x, y, z));
         break;
       case "eat":
         let itemName = args.itemName;
-        await this.eat(itemName);
+        this.actions.add(new EatAction(this.bot, itemName));
         break;
       case "follow_and_attack":
         let entityId = args.entityId;
-        await this.followAndAttack(entityId);
+        this.actions.add(new FollowAndAttackAction(this.bot, entityId));
         break;
       default:
         console.log(`[bot] ${this.bot.username} unknown tool call: ${name}`);
     }
-  }
-
-  private async moveTo(x: number, y: number, z: number): Promise<void> {
-    this.bot.chat(`Moving to (${x}, ${y}, ${z})`);
-    this.bot.pathfinder.setGoal(new goals.GoalBlock(x, y, z), false);
-  }
-
-  private async eat(itemName: string): Promise<void> {
-    this.bot.chat(`Eating ${itemName}`);
-    this.bot.pathfinder.stop();
-    let item = this.bot.inventory.items().find((i) => i.name === itemName);
-    if (item) {
-      console.log(`[bot] ${this.bot.username} eating ${itemName}`);
-      await this.bot.equip(item, "hand");
-      await this.bot.consume();
-    } else {
-      console.log(
-        `[bot] ${this.bot.username} cannot eat ${itemName}: not in inventory`,
-      );
-    }
-  }
-
-  private async followAndAttack(entityId: number): Promise<void> {
-    this.bot.chat(`Following and attacking entity ${entityId}`);
-    let entity = this.bot.entities[entityId];
-    if (entity) {
-      console.log(
-        `[bot] ${this.bot.username} following and attacking entity ${entityId}`,
-      );
-      this.bot.pathfinder.setGoal(
-        new goals.GoalFollow(entity, AiBot.FOLLOW_RANGE),
-        true,
-      );
-    } else {
-      console.log(
-        `[bot] ${this.bot.username} cannot follow and attack entity ${entityId}: not found`,
-      );
-      return;
-    }
-    this.lastAttackTick = () => {
-      if (!entity || !entity.isValid) {
-        this.bot.pathfinder.stop();
-        this.bot.removeListener("physicsTick", this.lastAttackTick);
-        return;
-      }
-      let dist = this.bot.entity.position.distanceTo(entity.position);
-      if (dist <= AiBot.ATTACK_RANGE) {
-        try {
-          this.bot.attack(entity);
-        } catch {}
-      }
-    };
-    this.bot.on("physicsTick", this.lastAttackTick);
   }
 }
 
@@ -320,7 +308,7 @@ function start() {
     movements.scafoldingBlocks = [];
     movements.placeCost = 9999;
     bot.pathfinder.setMovements(movements);
-    new AiBot(bot).action();
+    new AiBot(bot).act();
   });
 
   bot.on("chat", (username, message) => {
